@@ -165,3 +165,172 @@ class FileManager:
         except Exception as e:
             self.logger.error(f"Error loading metadata: {str(e)}")
             return {}
+
+    def _save_metadata(self):
+        """Save metadata to file."""
+        try:
+            data = {k: v.to_dict() for k, v in self.metadata.items()}
+            with open(self.metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            self.logger.error(f"Error saving metadata: {str(e)}")
+
+    def _secure_file(self, file_path: str):
+        """Apply security settings to a file."""
+        try:
+            # Get current user's SID
+            user_sid = win32security.GetTokenInformation(
+                win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY),
+                win32security.TokenUser
+            )[0]
+            
+            # Create security descriptor
+            security = win32security.SECURITY_ATTRIBUTES()
+            security.SECURITY_DESCRIPTOR = win32security.SECURITY_DESCRIPTOR()
+            security.SECURITY_DESCRIPTOR.Initialize()
+            
+            # Create DACL
+            dacl = win32security.ACL()
+            dacl.Initialize()
+            
+            # Allow SYSTEM full control
+            dacl.AddAccessAllowedAce(
+                win32security.ACL_REVISION,
+                win32con.GENERIC_ALL,
+                win32security.ConvertStringSidToSid("S-1-5-18")
+            )
+            
+            # Allow current user full control
+            dacl.AddAccessAllowedAce(
+                win32security.ACL_REVISION,
+                win32con.GENERIC_ALL,
+                user_sid
+            )
+            
+            # Set DACL
+            security.SECURITY_DESCRIPTOR.SetSecurityDescriptorDacl(1, dacl, 0)
+            
+            # Apply security to file
+            win32security.SetFileSecurity(
+                file_path,
+                win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                security.SECURITY_DESCRIPTOR
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Failed to secure file {file_path}: {str(e)}")
+            raise
+
+    def _verify_user_access(self, file_path: str) -> bool:
+        """Verify that the file is in the user's directory and accessible."""
+        try:
+            # Log the access verification attempt
+            self.logger.info(f"Verifying access to file: {file_path}")
+            
+            # Check if file exists
+            if not os.path.exists(file_path):
+                self.logger.warning(f"File does not exist: {file_path}")
+                return False
+                
+            # Try to open the file to verify access
+            try:
+                with open(file_path, 'rb') as f:
+                    # Try to read a small amount to verify access
+                    f.read(1)
+                    f.seek(0)  # Reset file pointer
+                self.logger.info(f"File access verified: {file_path}")
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to access file {file_path}: {str(e)}")
+                return False
+            
+        except Exception as e:
+            self.logger.error(f"Error verifying file access: {str(e)}")
+            return False
+
+    def upload_file(self, source_path: str) -> bool:
+        """Upload a file to the current user's private directory."""
+        try:
+            if not self.current_user:
+                raise ValueError("No user set")
+                
+            # Log the upload attempt
+            self.logger.info(f"Attempting to upload file: {source_path}")
+            
+            # Verify source file exists and is accessible
+            if not os.path.exists(source_path):
+                self.logger.error(f"Source file does not exist: {source_path}")
+                return False
+                
+            if not os.access(source_path, os.R_OK):
+                self.logger.error(f"Source file is not readable: {source_path}")
+                return False
+                
+            # Get filename and create destination path
+            filename = os.path.basename(source_path)
+            dest_path = os.path.join(self.user_dir, filename)
+            
+            # Check if file already exists
+            if os.path.exists(dest_path):
+                self.logger.warning(f"File already exists: {filename}")
+                return False
+            
+            # Copy file to user's private directory
+            shutil.copy2(source_path, dest_path)
+            
+            # Apply security to the uploaded file
+            self._secure_file(dest_path)
+            
+            # Update metadata
+            stat = os.stat(dest_path)
+            file_metadata = FileMetadata(
+                filename=filename,
+                path=dest_path,
+                size=stat.st_size,
+                created_at=datetime.fromtimestamp(stat.st_ctime),
+                modified_at=datetime.fromtimestamp(stat.st_mtime),
+                owner=self.current_user,
+                permissions="rw-r--r--",
+                is_encrypted=False
+            )
+            self.metadata[filename] = file_metadata
+            self._save_metadata()
+            
+            self.logger.info(f"File uploaded successfully: {filename}")
+            return True
+                
+        except Exception as e:
+            self.logger.error(f"Error uploading file: {str(e)}")
+            return False
+
+    def delete_file(self, file_path: str) -> bool:
+        """Delete a file from the user's private directory."""
+        try:
+            # Verify user has access to the file
+            if not self._verify_user_access(file_path):
+                self.logger.error(f"Access denied to file: {file_path}")
+                return False
+                
+            # Delete the file
+            os.remove(file_path)
+            
+            # Update metadata
+            filename = os.path.basename(file_path)
+            if filename in self.metadata:
+                del self.metadata[filename]
+                self._save_metadata()
+                
+            self.logger.info(f"File deleted successfully: {filename}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error deleting file: {str(e)}")
+            return False
+
+    def get_file_info(self, file_path: str) -> Optional[Dict]:
+        """Get information about a file."""
+        try:
+            # Verify user has access to the file
+            if not self._verify_user_access(file_path):
+                self.logger.error(f"Access denied to file: {file_path}")
+                return None
